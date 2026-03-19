@@ -71,13 +71,12 @@ Expected output:
 
 ## Step 4 — Add a Sample Task
 
-Insert a task definition directly via SQLite. This example schedules a daily backup script:
+Insert a task definition directly via SQLite. This example registers a daily backup task:
 
 ```bash
 sqlite3 ~/.orbit/orbit.db <<'SQL'
 INSERT INTO task_defs (
-  id, name, tier, sla_type, interval_ms, max_duration_ms,
-  enabled, run_backend, run_command
+  id, name, tier, sla_type, interval_ms, max_duration_ms, enabled
 ) VALUES (
   'sample-backup',
   'Daily Backup',
@@ -85,9 +84,7 @@ INSERT INTO task_defs (
   'soft',
   86400000,             -- 24 hours in milliseconds
   300000,               -- 5 minute max runtime
-  1,                    -- enabled
-  'script',             -- run directly as subprocess
-  'echo "backup complete: $(date)"'
+  1                     -- enabled
 );
 SQL
 ```
