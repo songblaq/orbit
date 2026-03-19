@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""ORBIT CLI — Operational Runtime for Background Intelligence Tasks"""
+import sys
+import os
+
+# Add src to path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='orbit',
+        description='ORBIT — R4 스코어링 기반 자율 태스크 스케줄러'
+    )
+    sub = parser.add_subparsers(dest='command')
+
+    # tick
+    sub.add_parser('tick', help='스케줄러 tick 실행 (shadow 또는 active)')
+
+    # dispatch
+    p_dispatch = sub.add_parser('dispatch', help='태스크 디스패치')
+    p_dispatch.add_argument('--tier', help='디스패치 tier (예: 1,2,3,4)')
+    p_dispatch.add_argument('--dry-run', action='store_true')
+
+    # status
+    p_status = sub.add_parser('status', help='ORBIT 상태 보기')
+    p_status.add_argument('--brief', action='store_true')
+    p_status.add_argument('--json', action='store_true')
+
+    # gate
+    p_gate = sub.add_parser('gate', help='활성화 게이트 체크')
+    p_gate.add_argument('action', nargs='?', choices=['check', 'activate'], default='check')
+    p_gate.add_argument('tiers', nargs='?', help='활성화할 tier (예: 4,5)')
+
+    # migrate
+    p_migrate = sub.add_parser('migrate', help='DB 스키마 마이그레이션')
+    p_migrate.add_argument('--status', action='store_true')
+
+    # observer
+    sub.add_parser('observer', help='크론 메타 옵저버 실행')
+
+    # dashboard
+    sub.add_parser('dashboard', help='CLI 대시보드 출력')
+
+    # config
+    p_config = sub.add_parser('config', help='설정 보기/변경')
+    p_config.add_argument('key', nargs='?')
+    p_config.add_argument('value', nargs='?')
+
+    # version
+    sub.add_parser('version', help='버전 정보')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    # Change to ORBIT data directory
+    orbit_home = os.environ.get('ORBIT_HOME', os.path.expanduser('~/.aria/orbit'))
+    if os.path.isdir(orbit_home):
+        os.chdir(orbit_home)
+
+    if args.command == 'tick':
+        import subprocess
+        subprocess.run([sys.executable, 'orbit-tick.py'])
+
+    elif args.command == 'dispatch':
+        cmd = [sys.executable, 'orbit-dispatch.py']
+        if args.tier: cmd.extend(['--tier', args.tier])
+        if args.dry_run: cmd.append('--dry-run')
+        import subprocess
+        subprocess.run(cmd)
+
+    elif args.command == 'status':
+        cmd = [sys.executable, 'orbit-status.py']
+        if args.brief: cmd.append('--brief')
+        if args.json: cmd.append('--json')
+        import subprocess
+        subprocess.run(cmd)
+
+    elif args.command == 'gate':
+        cmd = [sys.executable, 'orbit-gate.py']
+        if args.action: cmd.append(args.action)
+        if args.tiers: cmd.append(args.tiers)
+        import subprocess
+        subprocess.run(cmd)
+
+    elif args.command == 'migrate':
+        cmd = [sys.executable, 'orbit-migrate.py']
+        if args.status: cmd.append('--status')
+        import subprocess
+        subprocess.run(cmd)
+
+    elif args.command == 'observer':
+        import subprocess
+        subprocess.run([sys.executable, 'orbit-cron-observer.py'])
+
+    elif args.command == 'dashboard':
+        # Use the agenthive-dashboard if available
+        dash = os.path.join(orbit_home, 'agenthive-dashboard.py')
+        if os.path.exists(dash):
+            import subprocess
+            subprocess.run([sys.executable, dash])
+        else:
+            print('대시보드 스크립트를 찾을 수 없습니다.')
+
+    elif args.command == 'config':
+        from orbit_db import get_db, get_config, set_config
+        conn = get_db()
+        if args.key and args.value:
+            set_config(conn, args.key, args.value)
+            conn.commit()
+            print(f'  {args.key} = {args.value}')
+        elif args.key:
+            val = get_config(conn, args.key, '(미설정)')
+            print(f'  {args.key} = {val}')
+        else:
+            rows = conn.execute("SELECT key, value FROM system_config ORDER BY key").fetchall()
+            for r in rows:
+                print(f'  {r["key"]:28s} = {r["value"]}')
+        conn.close()
+
+    elif args.command == 'version':
+        print('ORBIT v2.0.0 — Operational Runtime for Background Intelligence Tasks')
+        print(f'Home: {orbit_home}')
+
+if __name__ == '__main__':
+    main()
