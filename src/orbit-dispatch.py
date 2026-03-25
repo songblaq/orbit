@@ -13,10 +13,12 @@ import shlex
 import sys
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 
 from orbit_db import (
     get_db, get_config, set_config, BACKEND, now_utc, json_dumps, close_db,
+    ORBIT_HOME_DEFAULT,
 )
 
 CONSECUTIVE_SUCCESS_THRESHOLD = 3  # 연속 성공 후 cron 비활성화
@@ -102,32 +104,70 @@ def run_cron_job(cron_job_id, dry_run=False):
         return False, duration_ms, str(e)
 
 
+def _command_has_shell_meta(command: str) -> bool:
+    """True if command likely needs a shell (pipes, redirects, compound lists, etc.)."""
+    triggers = (
+        "|", "$(", "`", "${", ">", "<", "&&", "||", ";", "\n", "\r",
+    )
+    return any(t in command for t in triggers)
+
+
 def run_script(command, timeout=120, dry_run=False):
-    """스크립트/명령 직접 실행. shell=False로 안전 실행.
-    파이프/리다이렉션이 필요한 명령은 ['bash', '-c', command] 래핑.
+    """스크립트/명령 직접 실행. 항상 shell=False argv 실행.
+    셸 메타문자가 있으면 ORBIT_ALLOW_SHELL이 있을 때만 [\"/bin/bash\", \"-c\", command]로 실행.
     결과: (success, duration_ms, error, output)"""
     if dry_run:
+        if _command_has_shell_meta(command) and not os.environ.get("ORBIT_ALLOW_SHELL"):
+            return (
+                False,
+                0,
+                "shell metacharacters require ORBIT_ALLOW_SHELL",
+                "[dry-run]",
+            )
         return True, 0, None, "[dry-run]"
 
     start = time.time()
     try:
-        # 파이프(|), 서브쉘($(...)), 리다이렉션(>, >>) 포함 시 bash -c 래핑
-        if any(ch in command for ch in ('|', '$(', '`', '>', '<', '&&', '||', ';')):
+        if _command_has_shell_meta(command):
+            if not os.environ.get("ORBIT_ALLOW_SHELL"):
+                return (
+                    False,
+                    0,
+                    "shell metacharacters in command require ORBIT_ALLOW_SHELL",
+                    "",
+                )
+            print(
+                "[orbit-dispatch] WARNING: executing script command with shell "
+                "metacharacters via /bin/bash -c (ORBIT_ALLOW_SHELL is set)",
+                file=sys.stderr,
+            )
             cmd_list = ["/bin/bash", "-c", command]
         else:
-            cmd_list = shlex.split(command)
+            try:
+                cmd_list = shlex.split(command)
+            except ValueError as e:
+                duration_ms = int((time.time() - start) * 1000)
+                return False, duration_ms, f"invalid command: {e}", ""
+            if not cmd_list:
+                duration_ms = int((time.time() - start) * 1000)
+                return False, duration_ms, "empty command", ""
+
         result = subprocess.run(
-            cmd_list, shell=False,
-            capture_output=True, text=True, timeout=timeout,
-            cwd=os.path.expanduser("~/.aria/orbit")
+            cmd_list,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=os.path.expanduser(
+                os.environ.get("ORBIT_HOME", ORBIT_HOME_DEFAULT)
+            ),
         )
         duration_ms = int((time.time() - start) * 1000)
         output = result.stdout.strip()[:1000]
         if result.returncode == 0:
             return True, duration_ms, None, output
-        else:
-            err = result.stderr.strip() or output
-            return False, duration_ms, err[:500], output
+        err = result.stderr.strip() or output
+        return False, duration_ms, err[:500], output
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         return False, duration_ms, f"timeout ({timeout}s)", ""
@@ -140,22 +180,28 @@ def run_khala(task_id, command, project=None):
     """Khala 메시지로 런타임에 작업 위임. 결과: (success, duration_ms, error, output)"""
     start = time.time()
     try:
-        import json as _json
         khala_dir = os.path.expanduser("~/.aria/khala/channels/global")
         tasks_file = os.path.join(khala_dir, "tasks.jsonl")
+        nonce = str(uuid.uuid4())[:8]
         msg = {
             "id": f"orbit-dispatch-{task_id}-{int(time.time())}",
             "channel": "global/tasks",
             "from": {"instance": "orbit", "agent": "orbit-dispatch"},
+            "to": {"instance": None, "agent": None},
+            "mention": [],
             "content": f"[orbit-dispatch] {task_id}: {command}",
             "type": "task",
             "priority": "normal",
+            "reply_to": None,
+            "artifacts": [],
+            "correlation_id": f"orbit-{task_id}",
             "context": {"project": project, "task_id": task_id},
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ttl": 3600,
+            "nonce": nonce,
         }
         with open(tasks_file, "a") as f:
-            f.write(_json.dumps(msg, ensure_ascii=False) + "\n")
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         duration_ms = int((time.time() - start) * 1000)
         return True, duration_ms, None, f"Khala published: {msg['id']}"
     except Exception as e:
@@ -300,76 +346,105 @@ def maybe_decommission(conn, task_id, dry_run=False):
     return False
 
 
+def _publish_dispatch_alert(results):
+    """Khala global/alerts.jsonl에 dispatch 요약 append (관측성)."""
+    try:
+        aria_home = os.path.expanduser(os.environ.get("ARIA_HOME", "~/.aria"))
+        alerts_dir = os.path.join(aria_home, "khala", "channels", "global")
+        alerts_file = os.path.join(alerts_dir, "alerts.jsonl")
+        task_count = len(results)
+        success = sum(1 for r in results if r.get("status") == "success")
+        failed = sum(1 for r in results if r.get("status") == "failed")
+        line = json.dumps(
+            {
+                "type": "dispatch-summary",
+                "task_count": task_count,
+                "success": success,
+                "failed": failed,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+        )
+        os.makedirs(alerts_dir, exist_ok=True)
+        with open(alerts_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"[orbit-dispatch] alerts append failed: {e}", file=sys.stderr)
+
+
 def dispatch_tier(conn, tick_id=None, dry_run=False):
     """설정된 tier의 enabled 태스크를 dispatch."""
-    mode = get_config(conn, "orbit_mode", "shadow")
-    if mode != "active" and not dry_run:
-        print(f"[dispatch] orbit_mode={mode} — dispatch 생략 (active 모드 필요)", file=sys.stderr)
-        return []
-
-    tiers = get_dispatch_tiers(conn)
-    if not tiers:
-        print("[dispatch] dispatch_tiers 미설정 — dispatch 생략", file=sys.stderr)
-        return []
-
-    # 해당 tier의 enabled 태스크 조회 (orbit_managed가 아직 0인 것만)
-    if BACKEND == "postgres":
-        placeholders = ",".join(["%s"] * len(tiers))
-    else:
-        placeholders = ",".join(["?"] * len(tiers))
-
-    tasks = conn.execute(f"""
-        SELECT * FROM task_defs
-        WHERE tier IN ({placeholders}) AND enabled AND NOT orbit_managed
-              AND (cron_job_id IS NOT NULL OR run_command IS NOT NULL)
-        ORDER BY tier ASC, id
-    """, tiers).fetchall()
-
-    if not tasks:
-        print(f"[dispatch] tier {tiers} — dispatch할 태스크 없음 (전부 orbit_managed 또는 disabled)")
-        return []
-
-    # ℝ⁴ dispatch_score 기반 정렬 (높을수록 먼저)
-    tasks = sorted(tasks, key=lambda t: compute_dispatch_score(t), reverse=True)
-    if tasks:
-        print(f"[dispatch] score 순서: " + ", ".join(
-            f"{t['id'][:20]}({compute_dispatch_score(t):.3f})" for t in tasks[:5]
-        ))
-
     results = []
-    for task in tasks:
-        started_at = now_utc()
-        task_id = task["id"]
-        cron_job_id = str(task["cron_job_id"])
+    try:
+        mode = get_config(conn, "orbit_mode", "shadow")
+        if mode != "active" and not dry_run:
+            print(f"[dispatch] orbit_mode={mode} — dispatch 생략 (active 모드 필요)", file=sys.stderr)
+            return results
 
-        # AgentHive 상태 가드: blocked/done/review이면 스킵
-        ah_status = task.get("agenthive_status") if hasattr(task, "get") else (task["agenthive_status"] if "agenthive_status" in task.keys() else None)
-        if ah_status and ah_status in AH_SKIP_STATUSES:
-            print(f"  ⏭️  skip T{task['tier']} {task_id} (agenthive_status={ah_status})")
-            continue
+        tiers = get_dispatch_tiers(conn)
+        if not tiers:
+            print("[dispatch] dispatch_tiers 미설정 — dispatch 생략", file=sys.stderr)
+            return results
 
-        backend = task.get("run_backend") or "openclaw"
-        print(f"  → dispatch T{task['tier']} {task_id} (backend={backend})")
-        success, duration_ms, error = run_task(task, dry_run=dry_run)
+        # 해당 tier의 enabled 태스크 조회 (orbit_managed가 아직 0인 것만)
+        if BACKEND == "postgres":
+            placeholders = ",".join(["%s"] * len(tiers))
+        else:
+            placeholders = ",".join(["?"] * len(tiers))
 
-        status = "success" if success else "failed"
-        record_run(conn, task_id, tick_id, status, started_at, duration_ms, error)
-        update_consecutive(conn, task_id, success)
-        maybe_decommission(conn, task_id, dry_run=dry_run)
+        tasks = conn.execute(f"""
+            SELECT * FROM task_defs
+            WHERE tier IN ({placeholders}) AND enabled AND NOT orbit_managed
+                  AND (cron_job_id IS NOT NULL OR run_command IS NOT NULL)
+            ORDER BY tier ASC, id
+        """, tiers).fetchall()
 
-        result = {
-            "task_id": task_id,
-            "tier": task["tier"],
-            "status": status,
-            "duration_ms": duration_ms,
-            "error": error,
-        }
-        results.append(result)
+        if not tasks:
+            print(f"[dispatch] tier {tiers} — dispatch할 태스크 없음 (전부 orbit_managed 또는 disabled)")
+            return results
 
-        icon = "✅" if success else "❌"
-        print(f"    {icon} {status} ({duration_ms}ms){' — ' + error if error else ''}")
+        # ℝ⁴ dispatch_score 기반 정렬 (높을수록 먼저)
+        tasks = sorted(tasks, key=lambda t: compute_dispatch_score(t), reverse=True)
+        if tasks:
+            print(f"[dispatch] score 순서: " + ", ".join(
+                f"{t['id'][:20]}({compute_dispatch_score(t):.3f})" for t in tasks[:5]
+            ))
 
-    return results
+        for task in tasks:
+            started_at = now_utc()
+            task_id = task["id"]
+            cron_job_id = str(task["cron_job_id"])
+
+            # AgentHive 상태 가드: blocked/done/review이면 스킵
+            ah_status = task.get("agenthive_status") if hasattr(task, "get") else (task["agenthive_status"] if "agenthive_status" in task.keys() else None)
+            if ah_status and ah_status in AH_SKIP_STATUSES:
+                print(f"  ⏭️  skip T{task['tier']} {task_id} (agenthive_status={ah_status})")
+                continue
+
+            backend = task.get("run_backend") or "openclaw"
+            print(f"  → dispatch T{task['tier']} {task_id} (backend={backend})")
+            success, duration_ms, error = run_task(task, dry_run=dry_run)
+
+            status = "success" if success else "failed"
+            record_run(conn, task_id, tick_id, status, started_at, duration_ms, error)
+            update_consecutive(conn, task_id, success)
+            maybe_decommission(conn, task_id, dry_run=dry_run)
+
+            result = {
+                "task_id": task_id,
+                "tier": task["tier"],
+                "status": status,
+                "duration_ms": duration_ms,
+                "error": error,
+            }
+            results.append(result)
+
+            icon = "✅" if success else "❌"
+            print(f"    {icon} {status} ({duration_ms}ms){' — ' + error if error else ''}")
+
+        return results
+    finally:
+        _publish_dispatch_alert(results)
 
 
 def main():

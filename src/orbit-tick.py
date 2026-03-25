@@ -13,7 +13,7 @@ import importlib.util
 from datetime import datetime, timezone
 
 from orbit_db import (
-    get_db, get_config, BACKEND, now_utc,
+    get_db, get_config, BACKEND, now_utc, SQLITE_PATH,
     try_advisory_lock, release_advisory_lock, close_db,
 )
 
@@ -129,7 +129,7 @@ def main():
     else:
         # SQLite: file-based lock via orbit-lock.py
         orbit_lock = _load_orbit_lock()
-        db_path = os.path.expanduser("~/.openclaw/data/orbit/orbit.db")
+        db_path = SQLITE_PATH
         lock = orbit_lock.OrbitLock(db_path, LOCK_KEY)
         acquired, msg = lock.acquire()
         if not acquired:

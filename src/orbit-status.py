@@ -15,7 +15,7 @@ import importlib.util
 from datetime import datetime, timezone
 
 from orbit_db import (
-    get_db, get_config, BACKEND, close_db,
+    get_db, get_config, BACKEND, close_db, SQLITE_PATH,
 )
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,7 +147,7 @@ def format_status(conn, top_n=5, as_json=False):
     lock_info = {}
     if BACKEND == "sqlite":
         orbit_lock = _load_orbit_lock()
-        db_path = os.path.expanduser("~/.openclaw/data/orbit/orbit.db")
+        db_path = SQLITE_PATH
         lock = orbit_lock.OrbitLock(db_path, "orbit-master-tick")
         lock_info = lock.get_info()
 

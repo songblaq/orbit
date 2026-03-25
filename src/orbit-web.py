@@ -8,6 +8,7 @@ Usage: python3 orbit-web.py [--port 4176] [--host 127.0.0.1]
 import argparse
 import json
 import os
+import secrets
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -19,6 +20,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from orbit_db import get_db, get_config, set_config, BACKEND, close_db
 
 P = "%s" if BACKEND == "postgres" else "?"
+
+# CORS origin used in response headers; overridden in main() once the port is known.
+_CORS_ORIGIN = '*'
+
+# POST /api/config: changing these requires ORBIT_ADMIN_TOKEN on the server and a matching Authorization header.
+PROTECTED_KEYS = frozenset({"orbit_mode", "dispatch_tiers"})
+
+
+def _authorized_protected_change(handler, key: str) -> tuple[bool, str | None]:
+    """Return (ok, error_message)."""
+    if key not in PROTECTED_KEYS:
+        return True, None
+    expected = (os.environ.get("ORBIT_ADMIN_TOKEN") or "").strip()
+    if not expected:
+        return False, "protected keys require ORBIT_ADMIN_TOKEN to be set on the server"
+    auth = (handler.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    else:
+        token = auth
+    if not token:
+        return False, "Authorization header required for protected config keys"
+    if not secrets.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+        return False, "invalid admin token"
+    return True, None
 
 # ── R4 score ─────────────────────────────────────────────────────────────────
 TIER_BONUS = {1: 1.0, 2: 0.75, 3: 0.5, 4: 0.25, 5: 0.0}
@@ -924,9 +950,12 @@ async function saveConfig(key) {
   if (!input) return;
   btn.disabled = true;
   try {
+    const headers = {'Content-Type': 'application/json'};
+    const adminTok = localStorage.getItem('ORBIT_ADMIN_TOKEN');
+    if (adminTok) headers['Authorization'] = 'Bearer ' + adminTok;
     const r = await fetch('/api/config', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers,
       body: JSON.stringify({key, value: input.value})
     });
     if (!r.ok) throw new Error(await r.text());
@@ -1000,7 +1029,7 @@ class OrbitHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', _CORS_ORIGIN)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1043,6 +1072,8 @@ class OrbitHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip('/')
+        remote_addr = self.client_address[0] if self.client_address else ''
+        print(f"[audit] {self.command} {path} from={remote_addr}", file=sys.stderr)
 
         if path == '/api/config':
             length = int(self.headers.get('Content-Length', 0))
@@ -1053,6 +1084,10 @@ class OrbitHandler(BaseHTTPRequestHandler):
                 value = payload.get('value', '')
                 if not key:
                     self._err('key required', 400)
+                    return
+                ok, err = _authorized_protected_change(self, key)
+                if not ok:
+                    self._err(err or 'forbidden', 403)
                     return
                 conn = get_db()
                 set_config(conn, key, value)
@@ -1068,9 +1103,9 @@ class OrbitHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', _CORS_ORIGIN)
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
 
 
@@ -1090,6 +1125,12 @@ def main():
     except Exception as e:
         print(f"[orbit-web] DB error: {e}", file=sys.stderr)
         sys.exit(1)
+
+    global _CORS_ORIGIN
+    _CORS_ORIGIN = os.environ.get("ORBIT_CORS_ORIGIN", f"http://localhost:{args.port}")
+
+    if not os.environ.get("ORBIT_ADMIN_TOKEN"):
+        print("[WARN] ORBIT_ADMIN_TOKEN not set — protected config keys cannot be changed", file=sys.stderr)
 
     server = HTTPServer((args.host, args.port), OrbitHandler)
     print(f"[orbit-web] Listening on http://{args.host}:{args.port}")

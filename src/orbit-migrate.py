@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 orbit-migrate — ORBIT schema migration 멱등 래퍼
-schema_migration_v2.sql의 ALTER TABLE ADD COLUMN 구문을 안전하게 재실행.
-이미 존재하는 컬럼/테이블은 건너뜀 (멱등).
+v2~v4: task_defs / system_config / watchdog_log / AgentHive 스키마를 순차·멱등 적용.
+v4는 컬럼·테이블 보강을 매 실행 시 확인하고, 프로젝트 매핑·버전 기록은 최초 1회만 수행.
 
 사용법:
   python3 orbit-migrate.py            # migration 실행
@@ -12,7 +12,7 @@ schema_migration_v2.sql의 ALTER TABLE ADD COLUMN 구문을 안전하게 재실�
 import os
 import sys
 
-from orbit_db import get_db, BACKEND
+from orbit_db import get_db, BACKEND, SQLITE_PATH
 
 P = "%s" if BACKEND == "postgres" else "?"
 
@@ -179,16 +179,94 @@ def run_v2(conn):
     return changed
 
 
-def run_v4(conn):
-    """Migration v4: AgentHive 연동 컬럼 추가."""
+def run_v3(conn):
+    """Migration v3: watchdog_log 테이블, task_defs.p_lord (schema_migration_v3 + v3_add_plord)."""
     changed = []
+
+    existing_td = get_columns(conn, "task_defs")
+    if "p_lord" not in existing_td:
+        if BACKEND == "postgres":
+            conn.execute(
+                "ALTER TABLE task_defs ADD COLUMN p_lord DOUBLE PRECISION DEFAULT 0.5"
+            )
+        else:
+            conn.execute(
+                "ALTER TABLE task_defs ADD COLUMN p_lord REAL DEFAULT 0.5"
+            )
+        changed.append("task_defs.p_lord 추가")
+    else:
+        print("  skip: task_defs.p_lord 이미 존재")
+
+    if BACKEND == "postgres":
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchdog_log (
+              id             SERIAL PRIMARY KEY,
+              checked_at     TEXT NOT NULL,
+              owner_pid      INTEGER NOT NULL,
+              lock_held      INTEGER DEFAULT 0,
+              lock_owner_pid INTEGER,
+              lock_age_ms    INTEGER,
+              bypass_reason  TEXT,
+              action         TEXT NOT NULL DEFAULT 'check'
+                             CHECK(action IN ('check','bypass','alert','ok')),
+              t1_task_ids    TEXT,
+              alert_count    INTEGER DEFAULT 0,
+              notes          TEXT,
+              created_at     TEXT NOT NULL DEFAULT (NOW()::TEXT)
+            )
+        """)
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchdog_log (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              checked_at     TEXT NOT NULL,
+              owner_pid      INTEGER NOT NULL,
+              lock_held      INTEGER DEFAULT 0,
+              lock_owner_pid INTEGER,
+              lock_age_ms    INTEGER,
+              bypass_reason  TEXT,
+              action         TEXT NOT NULL DEFAULT 'check'
+                             CHECK(action IN ('check','bypass','alert','ok')),
+              t1_task_ids    TEXT,
+              alert_count    INTEGER DEFAULT 0,
+              notes          TEXT,
+              created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+    changed.append("watchdog_log 테이블 생성(or skip)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watchdog_log_at ON watchdog_log(checked_at DESC)"
+    )
+
+    if BACKEND == "postgres":
+        conn.execute("""
+            INSERT INTO schema_migrations(version, description)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+        """, (3, 'WS-2: watchdog_log table, p_lord on task_defs'))
+    else:
+        conn.execute("""
+            INSERT OR IGNORE INTO schema_migrations(version, description)
+            VALUES (3, 'WS-2: watchdog_log table, p_lord on task_defs')
+        """)
+    conn.commit()
+    return changed
+
+
+def run_v4(conn):
+    """Migration v4: AgentHive — schema_migration_v4.sql + v4_agenthive.sql 컬럼 통합."""
+    changed = []
+    v4_needs_record = not migration_applied(conn, 4)
 
     existing = get_columns(conn, "task_defs")
     new_columns = [
-        ("agenthive_project",   "TEXT"),
-        ("agenthive_task_id",   "TEXT"),
-        ("agenthive_status",    "TEXT"),
-        ("agenthive_synced_at", "TEXT"),
+        ("agenthive_project",           "TEXT"),
+        ("agenthive_task_id",           "TEXT"),
+        ("agenthive_status",            "TEXT"),
+        ("agenthive_synced_at",         "TEXT"),
+        ("ah_sync_enabled",             "INTEGER DEFAULT 1"),
+        ("ah_status_last_checked_at",   "TEXT"),
+        ("ah_status_last_result",       "TEXT"),
     ]
     for col, col_type in new_columns:
         if col not in existing:
@@ -197,54 +275,110 @@ def run_v4(conn):
         else:
             print(f"  skip: task_defs.{col} 이미 존재")
 
-    # 인덱스
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_defs_ah_project ON task_defs(agenthive_project)")
 
-    # 기본 AgentHive 프로젝트 매핑 (Orbit task_id → AH project)
-    ah_mappings = [
-        ("ops-%",              "ops"),
-        ("ha00%",              "ops"),
-        ("infra-%",            "ops"),
-        ("drift-%",            "ops"),
-        ("deepcron-%",         "ops"),
-        ("sns-%",              "content-factory"),
-        ("botmadang-%",        "content-factory"),
-        ("maltbook-%",         "content-factory"),
-        ("x-twitter-%",        "content-factory"),
-        ("exercise-%",         "smart-gym"),
-        ("ai-%",               "research-lab"),
-        ("investment-%",       "research-lab"),
-        ("cafe-%",             "ops"),
-        ("deepwork-%",         "research-lab"),
-        ("morning-%",          "ops"),
-        ("daily-%",            "ops"),
-        ("project-%",          "openclaw"),
-        ("luca-%",             "research-lab"),
-    ]
-    for pattern, ah_project in ah_mappings:
-        if BACKEND == "postgres":
-            conn.execute("""
-                UPDATE task_defs SET agenthive_project = %s
-                WHERE id LIKE %s AND agenthive_project IS NULL
-            """, (ah_project, pattern))
-        else:
-            conn.execute("""
-                UPDATE task_defs SET agenthive_project = ?
-                WHERE id LIKE ? AND agenthive_project IS NULL
-            """, (ah_project, pattern))
-
-    # migration 버전 기록
     if BACKEND == "postgres":
         conn.execute("""
-            INSERT INTO schema_migrations(version, description)
-            VALUES (%s, %s)
-            ON CONFLICT DO NOTHING
-        """, (4, 'AgentHive integration: agenthive_project, agenthive_task_id, agenthive_status columns'))
+            CREATE TABLE IF NOT EXISTS agenthive_sync_log (
+              id                SERIAL PRIMARY KEY,
+              task_id           TEXT NOT NULL,
+              checked_at        TEXT NOT NULL,
+              ah_project        TEXT,
+              ah_task_id        TEXT,
+              ah_status         TEXT,
+              dispatch_decision TEXT CHECK(dispatch_decision IS NULL OR dispatch_decision IN ('proceeded', 'skipped', 'error')),
+              reason            TEXT,
+              error_message     TEXT,
+              created_at        TEXT NOT NULL DEFAULT (NOW()::TEXT)
+            )
+        """)
     else:
         conn.execute("""
-            INSERT OR IGNORE INTO schema_migrations(version, description)
-            VALUES (4, 'AgentHive integration: agenthive_project, agenthive_task_id, agenthive_status columns')
+            CREATE TABLE IF NOT EXISTS agenthive_sync_log (
+              id                INTEGER PRIMARY KEY AUTOINCREMENT,
+              task_id           TEXT NOT NULL,
+              checked_at        TEXT NOT NULL,
+              ah_project        TEXT,
+              ah_task_id        TEXT,
+              ah_status         TEXT,
+              dispatch_decision TEXT CHECK(dispatch_decision IN ('proceeded', 'skipped', 'error')),
+              reason            TEXT,
+              error_message     TEXT,
+              created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+            )
         """)
+    changed.append("agenthive_sync_log 테이블 생성(or skip)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agenthive_sync_log_task_id ON agenthive_sync_log(task_id, checked_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agenthive_sync_log_at ON agenthive_sync_log(checked_at DESC)"
+    )
+
+    ah_cfg = [
+        ("agenthive_api_url",           "http://localhost:8100",  "AgentHive API base URL (OpenJarvis default)"),
+        ("agenthive_api_timeout_sec",   "5",                      "AH API request timeout in seconds"),
+        ("agenthive_sync_interval_min", "30",                     "Minimum interval between AH status checks (minutes)"),
+    ]
+    for key, val, note in ah_cfg:
+        if BACKEND == "postgres":
+            conn.execute("""
+                INSERT INTO system_config(key, value, note)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (key, val, note))
+        else:
+            conn.execute("""
+                INSERT OR IGNORE INTO system_config(key, value, note)
+                VALUES (?, ?, ?)
+            """, (key, val, note))
+
+    if v4_needs_record:
+        # 기본 AgentHive 프로젝트 매핑 (Orbit task_id → AH project)
+        ah_mappings = [
+            ("ops-%",              "ops"),
+            ("ha00%",              "ops"),
+            ("infra-%",            "ops"),
+            ("drift-%",            "ops"),
+            ("deepcron-%",         "ops"),
+            ("sns-%",              "content-factory"),
+            ("botmadang-%",        "content-factory"),
+            ("maltbook-%",         "content-factory"),
+            ("x-twitter-%",        "content-factory"),
+            ("exercise-%",         "smart-gym"),
+            ("ai-%",               "research-lab"),
+            ("investment-%",       "research-lab"),
+            ("cafe-%",             "ops"),
+            ("deepwork-%",         "research-lab"),
+            ("morning-%",          "ops"),
+            ("daily-%",            "ops"),
+            ("project-%",          "openclaw"),
+            ("luca-%",             "research-lab"),
+        ]
+        for pattern, ah_project in ah_mappings:
+            if BACKEND == "postgres":
+                conn.execute("""
+                    UPDATE task_defs SET agenthive_project = %s
+                    WHERE id LIKE %s AND agenthive_project IS NULL
+                """, (ah_project, pattern))
+            else:
+                conn.execute("""
+                    UPDATE task_defs SET agenthive_project = ?
+                    WHERE id LIKE ? AND agenthive_project IS NULL
+                """, (ah_project, pattern))
+
+        if BACKEND == "postgres":
+            conn.execute("""
+                INSERT INTO schema_migrations(version, description)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+            """, (4, 'AgentHive: task_defs AH columns + ah_sync_* + agenthive_sync_log + system_config'))
+        else:
+            conn.execute("""
+                INSERT OR IGNORE INTO schema_migrations(version, description)
+                VALUES (4, 'AgentHive: task_defs AH columns + ah_sync_* + agenthive_sync_log + system_config')
+            """)
+        changed.append("v4 기본 프로젝트 매핑 + schema_migrations 기록")
     conn.commit()
     return changed
 
@@ -275,7 +409,7 @@ def cmd_status(conn):
 
 def main():
     if BACKEND == "sqlite":
-        db_path = os.path.expanduser("~/.openclaw/data/orbit/orbit.db")
+        db_path = SQLITE_PATH
         if not os.path.exists(db_path):
             print(f"DB 없음: {db_path}", file=sys.stderr)
             sys.exit(1)
@@ -298,14 +432,20 @@ def main():
         else:
             print("  v2 이미 적용됨 — 건너뜀")
 
-        if not migration_applied(conn, 4):
-            print("  v4 migration 실행 중 (AgentHive 연동)...")
-            changed = run_v4(conn)
+        if not migration_applied(conn, 3):
+            print("  v3 migration 실행 중 (watchdog_log, p_lord)...")
+            changed = run_v3(conn)
             for c in changed:
                 print(f"  ✅ {c}")
-            print("  ✅ v4 migration 완료")
+            print("  ✅ v3 migration 완료")
         else:
-            print("  v4 이미 적용됨 — 건너뜀")
+            print("  v3 이미 적용됨 — 건너뜀")
+
+        print("  v4 스키마 확인 (AgentHive, 멱등)...")
+        changed = run_v4(conn)
+        for c in changed:
+            print(f"  ✅ {c}")
+        print("  ✅ v4 확인 완료")
 
         cmd_status(conn)
 

@@ -16,7 +16,7 @@ import json
 import time
 from datetime import datetime, timezone
 
-from orbit_db import get_db, BACKEND, now_utc, close_db
+from orbit_db import get_db, BACKEND, now_utc, close_db, _stable_lock_id
 
 LOCK_DIR = "/tmp"
 LOCK_TTL_SEC = 600  # 10분
@@ -25,11 +25,6 @@ LOCK_TTL_SEC = 600  # 10분
 def _lock_path(lock_key: str) -> str:
     safe = lock_key.replace("/", "_").replace(":", "_")
     return os.path.join(LOCK_DIR, f"orbit-{safe}.lock")
-
-
-def _lock_id(lock_key: str) -> int:
-    """lock_key → 안정적 hash int (pg_advisory_lock용)."""
-    return hash(lock_key) & 0x7FFFFFFF
 
 
 class OrbitLock:
@@ -53,7 +48,7 @@ class OrbitLock:
     def _pg_acquire(self) -> tuple[bool, str]:
         """pg_try_advisory_lock으로 락 획득 시도."""
         conn = get_db()
-        lid = _lock_id(self.lock_key)
+        lid = _stable_lock_id(self.lock_key)
         row = conn.execute(
             "SELECT pg_try_advisory_lock(%s) AS acquired", (lid,)
         ).fetchone()
@@ -68,7 +63,7 @@ class OrbitLock:
     def _pg_release(self):
         if self._pg_conn is not None:
             try:
-                lid = _lock_id(self.lock_key)
+                lid = _stable_lock_id(self.lock_key)
                 self._pg_conn.execute("SELECT pg_advisory_unlock(%s)", (lid,))
                 self._pg_conn.commit()
             except Exception:
@@ -81,7 +76,7 @@ class OrbitLock:
         """pg_locks를 통해 현재 advisory lock 보유 여부 확인."""
         try:
             conn = get_db()
-            lid = _lock_id(self.lock_key)
+            lid = _stable_lock_id(self.lock_key)
             row = conn.execute("""
                 SELECT pid FROM pg_locks
                 WHERE locktype='advisory'

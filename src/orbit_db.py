@@ -7,12 +7,26 @@ orbit_db — ORBIT 듀얼 백엔드 DB 추상화 모듈
     from orbit_db import get_db, get_config, set_config, BACKEND
 """
 
+import hashlib
 import os
 import json
 from datetime import datetime, timezone
 
+
+def _stable_lock_id(name: str) -> int:
+    return int.from_bytes(
+        hashlib.md5(name.encode()).digest()[:4], "big"
+    ) & 0x7FFFFFFF
+
+
+ORBIT_HOME_DEFAULT = "~/.aria/orbit"
+
 BACKEND = os.environ.get("ORBIT_DB_BACKEND", "postgres").lower()
-SQLITE_PATH = os.path.expanduser("~/.openclaw/data/orbit/orbit.db")
+SQLITE_PATH = os.path.expanduser(
+    os.environ.get("ORBIT_SQLITE_PATH", os.path.join(
+        os.environ.get("ORBIT_HOME", ORBIT_HOME_DEFAULT), "orbit.db"
+    ))
+)
 PG_DSN = os.environ.get("ORBIT_PG_DSN", "dbname=openclaw")
 SCHEMA = "orbit"
 
@@ -111,8 +125,7 @@ def json_dumps(obj):
 def try_advisory_lock(conn, lock_name="orbit-master-tick"):
     """PG: pg_try_advisory_lock, SQLite: 파일 기반 (orbit-lock.py 위임)."""
     if BACKEND == "postgres":
-        # lock_name → 안정적 hash int
-        lock_id = hash(lock_name) & 0x7FFFFFFF
+        lock_id = _stable_lock_id(lock_name)
         row = conn.execute(
             "SELECT pg_try_advisory_lock(%s) AS acquired", (lock_id,)
         ).fetchone()
@@ -125,7 +138,7 @@ def try_advisory_lock(conn, lock_name="orbit-master-tick"):
 def release_advisory_lock(conn, lock_name="orbit-master-tick"):
     """PG advisory lock 해제."""
     if BACKEND == "postgres":
-        lock_id = hash(lock_name) & 0x7FFFFFFF
+        lock_id = _stable_lock_id(lock_name)
         conn.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
 
