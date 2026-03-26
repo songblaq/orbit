@@ -2,6 +2,12 @@
 """
 ORBIT ↔ AgentHive 동기화 스크립트
 
+Source of Truth (SoT) 정책:
+- AgentHive 파일 허브가 태스크 상태의 SoT이다
+- orbit-hive-sync는 SoT를 읽어 ORBIT DB에 캐싱하는 단방향 동기화이다
+- 상태 충돌 시 AgentHive 파일이 우선한다
+- ORBIT DB의 agenthive_status 필드는 캐시이며 직접 수정하지 않는다
+
 기능:
 1. AgentHive ready 태스크를 ORBIT task_defs에 등록 (없으면 생성)
 2. ORBIT 실행 결과를 AgentHive Collab에 자동 기록

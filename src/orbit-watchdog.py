@@ -13,7 +13,7 @@ import time
 import importlib.util
 from datetime import datetime, timezone
 
-from orbit_db import get_db, BACKEND, now_utc
+from orbit_db import get_db, BACKEND, now_utc, SQLITE_PATH
 
 TICK_LOCK_KEY = "orbit-master-tick"
 T1_ALERT_THRESHOLD_MS = 20 * 60 * 1000
@@ -92,7 +92,7 @@ def main():
 
         # WS-1: tick lock 상태 조회 (bypass — 점검만, 획득 안 함)
         # db_path 인자는 SQLite 호환성을 위해 전달하되 postgres에서는 무시됨
-        db_path = os.path.expanduser("~/.openclaw/data/orbit/orbit.db")
+        db_path = SQLITE_PATH
         tick_lock = orbit_lock.OrbitLock(db_path, TICK_LOCK_KEY)
         lock_info = tick_lock.get_info()
 

@@ -12,9 +12,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from orbit_db import BACKEND, now_utc
-
-SQLITE_PATH = os.path.expanduser("~/.openclaw/data/orbit/orbit.db")
+from orbit_db import BACKEND, now_utc, SQLITE_PATH
 
 
 def run_checkpoint():

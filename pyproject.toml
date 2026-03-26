@@ -11,3 +11,8 @@ orbit = "src.orbit_cli:main"
 
 [project.optional-dependencies]
 postgres = ["psycopg2-binary"]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
